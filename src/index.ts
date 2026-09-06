@@ -21,7 +21,7 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import { AgentCompactEngine } from 'dsh-agent-compact'
 
 export const name = 'compact-provider'
-export const inject = ['llm', 'tokenMeter', 'sessions', 'tools'] as const
+export const inject = ['llm', 'tokenMeter', 'sessions', 'tools', 'checkpoint'] as const
 
 /** 复用 AgentCompactEngine 的完整配置 schema */
 export const Config = AgentCompactEngine.Config as never
@@ -50,12 +50,23 @@ export function apply(ctx: Context, config: Record<string, unknown>): void {
       if (!compaction) return { ok: false, error: 'compaction seam 不可用（AgentCompactEngine 未就绪）' }
       const agent = exec.agent
       if (!agent) return { ok: false, error: '当前执行无 agent 上下文' }
+      // 压缩前自动存档（保命优先 2026-09-06）：压缩是上下文整合，先留健康快照防试错损失。
+      // best-effort：checkpoint 服务不可用或存档失败不阻塞压缩（压缩本身可重试）。
+      try {
+        const cp = (ctx as unknown as { checkpoint?: { create(reason: string): Promise<unknown> } }).checkpoint
+        if (cp !== undefined) {
+          await cp.create('压缩前自动存档（' + (args.reason ?? '') + '）')
+          logger.info('压缩前自动存档完成（' + args.reason + '）')
+        }
+      } catch (err) {
+        logger.warn('压缩前自动存档失败（不阻塞压缩）: ' + String(err))
+      }
       try {
         logger.info('爱丽丝决策压缩: ' + args.reason)
         // 关键：不传 exec.signal——工具调用被回合打断（abort）会触发 agent.cancel 导致 whenIdle 永不 resolve；
         // 用独立 controller，压缩事务与工具回合解耦
         await compaction.compactNow(agent, new AbortController().signal, 'alice-self-compact')
-        return { ok: true, note: '压缩已启动：' + (args.reason ?? '') + '——请输出 <compacted-summary> checkpoint 完成事务' }
+        return { ok: true, note: '压缩已启动：' + (args.reason ?? '') + '（压缩前已自动存档）——请输出 <compacted-summary> checkpoint 完成事务' }
       } catch (err) {
         return { ok: false, error: '压缩启动失败: ' + String(err) }
       }
