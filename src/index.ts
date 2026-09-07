@@ -68,7 +68,9 @@ export function apply(ctx: Context, config: Record<string, unknown>): void {
         await compaction.compactNow(agent, new AbortController().signal, 'alice-self-compact')
         return { ok: true, note: '压缩已启动：' + (args.reason ?? '') + '（压缩前已自动存档）——请输出 <compacted-summary> checkpoint 完成事务' }
       } catch (err) {
-        return { ok: false, error: '压缩启动失败: ' + String(err) }
+        const stack = err instanceof Error ? (err.stack ?? String(err)) : String(err)
+        logger.error('压缩启动失败堆栈: ' + stack)
+        return { ok: false, error: '压缩启动失败: ' + String(err) + '\n' + stack.slice(0, 2000) }
       }
     },
   }))

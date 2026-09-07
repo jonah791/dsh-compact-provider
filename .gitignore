@@ -4,3 +4,6 @@ lib/
 data/
 .dsh/
 
+
+*.bak
+*.bak-*
