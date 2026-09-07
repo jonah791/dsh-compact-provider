@@ -10,6 +10,12 @@
 -->
 # dsh-compact-provider
 
+
+<p align="center">
+  <a href="https://github.com/jonah791/dsh-compact-provider"><img src="https://img.shields.io/badge/version-0.2.0-blue" alt="version"></a>
+  <img src="https://img.shields.io/badge/License-MIT-green" alt="license">
+  <img src="https://img.shields.io/badge/TypeScript-3178C6" alt="TypeScript">
+</p>
 独立压缩插件：把自研 AgentCompactEngine 挂载为 compaction 服务（想压就压，busy 会话也可压缩），替代官方 compaction-basic 三件套
 
 ## 生态
