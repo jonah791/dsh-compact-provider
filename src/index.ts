@@ -4,7 +4,10 @@
  *
  * 三条入口：
  *  ① `session_compact` 工具 —— 爱丽丝轮内自主决策（代价：意图请求 + 摘要请求）
- *  ② **直触压缩** —— `turn/end` 处按常设授权直接开跑（代价：只有摘要请求）
+ *  ② **直触压缩** —— 常设授权命中即直接开跑，**两个触发点**：
+ *     · `agent/pre-step`（轮内每步之前）⇒ 压缩落在**当前这一轮**（主人 2026-09-14 定调「在当前 turn 就能压缩」）
+ *     · `turn/end`（每轮收尾）⇒ 会话空闲也主动压（下一轮的第一笔请求就已看见压缩后的上下文）
+ *     代价：只有摘要请求（省掉「意图请求」）
  *  ③ 引擎 `auto` 路径 —— 官方 replay 摘要器（本部署 `auto: false`，未启用）
  *
  * 直触的动机与判据见 `src/direct.ts` 顶部注释与 `docs/semantic.md`；核心事实是
@@ -21,7 +24,7 @@ import { dirname, join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { defineTool } from '@deepseek-ai/dsh-tools'
-import type { Agent } from '@deepseek-ai/dsh-agent'
+import type { Agent, PreStepDecision } from '@deepseek-ai/dsh-agent'
 // Type-only：把 tokenMeter 服务注入 Context 类型（与 dsh-agent-compact 同款手法；
 // 缺这行 tsc 报 TS2339: Property 'tokenMeter' does not exist on type 'Context'）
 import type { TokenMeter } from '@deepseek-ai/dsh-token-meter'
@@ -44,6 +47,9 @@ export const Config = AgentCompactEngine.Config as never
 
 /** 留痕文件体积上限：超过则保留末尾 400 行（防无限增长）。 */
 const LEDGER_MAX_BYTES = 512 * 1024
+
+/** 轮内触发点的判定节流：`agent/pre-step` 每步都发，避免每步都读盘。 */
+const EVALUATE_THROTTLE_MS = 2_000
 
 /** DSH_HOME（缺省 `~/.dsh`）：授权/状态/留痕的落点。 */
 function dshHome(): string {
@@ -112,8 +118,10 @@ export function apply(ctx: Context, config: Record<string, unknown>): void {
   const policyPath = join(home, 'compact-direct-policy.json')
   const statePath = join(home, 'compact-direct-state.json')
   const ledgerPath = join(home, 'compact-direct.jsonl')
-  /** `session.id → agent`：`turn/end` 只给 session，agent 由 `agent/status` 记住（不新增 inject）。 */
+  /** `session.id → agent`：`turn/end` 只给 session，agent 由 `agent/status` / `agent/pre-step` 记住。 */
   const knownAgents = new Map<string, Agent>()
+  /** 轮内触发点的节流表（`session.id → 上次判定时刻`）。 */
+  const lastEvaluatedAt = new Map<string, number>()
 
   const readJson = (path: string): unknown => {
     try {
@@ -163,7 +171,10 @@ export function apply(ctx: Context, config: Record<string, unknown>): void {
     }
   }
 
-  /** 判定 → 触发（在 running 会话 turn 收尾后调用）。 */
+  /**
+   * 判定 → 触发。两个调用点共用：`agent/pre-step`（轮内，压缩落在当前轮）与
+   * `session/event` 的 `turn/end`（空闲兜底）。判定本身纯函数、IO 全在本层。
+   */
   const evaluateDirectTrigger = async (sessionId: string): Promise<void> => {
     const agent = knownAgents.get(sessionId)
     if (agent === undefined || compaction === undefined) return
@@ -219,6 +230,29 @@ export function apply(ctx: Context, config: Record<string, unknown>): void {
   ctx.on('agent/status', (payload: { agent: Agent }) => {
     knownAgents.set(payload.agent.session.id, payload.agent)
   })
+
+  // ── 触发点 ①：轮内每步之前 ⇒ 压缩落在**当前这一轮**（主人 2026-09-14：「我的意思是在当前 turn 就能压缩」）──
+  // 机制：`agentSummarize` 用 `agent.send(instruction, 'next-turn', true)` 投递指令，busy 会话的指令会在
+  // **同一轮的下一个 step** 被消费（turn 71 实测：8092 触发 → 8097 checkpoint，同一轮 = 轮内可压）。
+  // 纪律：① 本 hook 是 waterfall，**必须 `next()` 放行** ② **不 await**（同步执行会阻塞这一步的请求）
+  //       ③ 2 秒节流（每步都发，别每步都读盘） ④ 判定异常一律吞掉，绝不影响这一步。
+  ctx.on('agent/pre-step', (payload: { agent: Agent }, next: () => Promise<PreStepDecision>): Promise<PreStepDecision> => {
+    try {
+      const agent = payload.agent
+      if (agent !== undefined) {
+        const sessionId = agent.session.id
+        knownAgents.set(sessionId, agent)
+        const now = Date.now()
+        if (now - (lastEvaluatedAt.get(sessionId) ?? 0) >= EVALUATE_THROTTLE_MS) {
+          lastEvaluatedAt.set(sessionId, now)
+          void evaluateDirectTrigger(sessionId)
+        }
+      }
+    } catch { /* 判定失败不得影响这一步 */ }
+    return next()
+  })
+
+  // ── 触发点 ②：每轮收尾 ⇒ 会话空闲也主动压（下一轮的第一笔请求就已看见压缩后的上下文）──
   ctx.on('session/event', (session: { id: string }, event: unknown) => {
     if ((event as { type?: string } | null)?.type !== 'turn/end') return
     // setImmediate：等这一轮真正收尾再判定（reenter 纪律 §5.12 §4：事件回调内不得同步重入）

@@ -27,7 +27,7 @@
 - **飞行中**：最近一次 `compaction/start` 晚于最近一次 `compaction/end`（事务未落定）。
 
 ## 4 概念模型与不变量
-模型：`turn/end`（每轮必发）→ 取该会话的 agent → `tokenMeter.measure` → 读授权 + 状态 → **纯函数判定** → 触发/跳过 → 留痕。
+模型（两个触发点共用同一判定）：`agent/pre-step`（轮内每步前）或 `turn/end`（每轮收尾）→ 取该会话的 agent → `tokenMeter.measure` → 读授权 + 状态 → **纯函数判定** → 触发/跳过 → 留痕。
 
 - **I1 决策归爱丽丝**：触发只能来自她撰写的授权文件；文件缺失/损坏 → 永不触发（fail-closed）。
 - **I2 授权会衰减**：`expiresAt` 到期即失效（不可解析的 `expiresAt` 同样视为过期）。
@@ -35,6 +35,7 @@
 - **I4 可追溯**：每一次判定（含跳过）落一行 `.dsh/compact-direct.jsonl`（数字 + 结论）。
 - **I5 只碰用户会话**：`session-*` 前缀；派生会话（子代理裸 uuid）不直触。
 - **I6 不改事务语义**：直触复用引擎 `compactNow`，事件序列与工具路径完全一致。
+- **I7 轮内可压（2026-09-14 主人定调）**：触发点之一在 `agent/pre-step`（轮内每一步之前），压缩**不需要额外一轮**——总结指令落在**同一轮的下一个 step**，checkpoint 与 `compaction/end` 都在触发所在的那一轮内完成（与 turn 71 实测同形：8092 触发 → 8097 checkpoint，同一轮）。`agent/pre-step` 是 waterfall：必须 `next()` 放行、**不 await**、2 秒节流、异常一律吞掉。
 
 ## 5 契约（含调用点清单）
 ### 5.1 授权文件 `.dsh/compact-direct-policy.json`
@@ -61,7 +62,8 @@
 | 调用点 | 位置 | 作用 |
 |---|---|---|
 | `ctx.on('agent/status')` | `src/index.ts` | 记住 `session.id → agent`（`turn/end` 时按 id 取回；不依赖新 inject） |
-| `ctx.on('session/event')` `turn/end` | `src/index.ts` | 判定入口（`setImmediate` 让 turn 真正收尾） |
+| `ctx.on('agent/pre-step')` | `src/index.ts` | **轮内触发点**（waterfall：`next()` 放行、不 await、2 秒节流）⇒ 压缩落在当前轮（I7） |
+| `ctx.on('session/event')` `turn/end` | `src/index.ts` | **空闲兜底触发点**（`setImmediate` 让 turn 真正收尾） |
 | `parseDirectPolicy` / `decideDirectCompaction` | `src/direct.ts` | 纯判定（无 IO） |
 | `hasOpenCompaction` | `src/direct.ts` | 飞行检测（读事件流，有界回溯） |
 | `compaction.compactNow(agent, signal, DIRECT_COMPACT_COMMAND_ID)` | `src/index.ts` | 引擎入口（与工具路径同一函数） |
@@ -83,6 +85,8 @@
 | A5 | 一次直触压缩的全上下文请求数 = **1**（今日工具路径为 2：563,054 + 566,783） | 事件流 `assistant/message.usage` 按 turn 汇总 | 待线上验收 |
 | A6 | 直触产物与工具路径同形（`compaction/start|summary|end` + `sourceCommandId="alice-direct-compact"`） | 事件流 | 待线上验收 |
 | A7 | 授权到期/不可解析 → 不触发 | 单测 | 待线上验收 |
+| A8 | **轮内可压（I7）**：直触的 checkpoint 与 `compaction/end` 落在**触发所在的那一轮**（不需要额外一轮） | 事件流：`compaction/start.turn` = `compaction/end.turn` = checkpoint 的 `assistant/message.turn` | 待线上验收 |
+| A9 | 轮内触发点不阻塞这一步：`agent/pre-step` 后本步请求正常发生 | 事件流 step 序列连续 + 无 `turn/end.reason=error` | 待线上验收 |
 
 ## 8 与实现关系
 - 纯函数（可单测）：`parseDirectPolicy`、`decideDirectCompaction`、`countTriggeredToday`、`pruneHistory`、`ledgerLine`、`hasOpenCompaction`。
@@ -90,6 +94,7 @@
 
 ## 9 实践修订记录
 - 2026-09-14（本版缘起）：主人指出「现在完成① 触发那一拍的正常请求（563k，只为说出『我要压缩』），就可以直接进行压缩」。取证：turn 71 两笔请求 563,054 + 566,783 = `1.13M`（GUI「用量 1.1M tok」逐字吻合），确认①为可省项；`agentSummarize` 的 `agent.send(..., 'next-turn', true)` 证明直触能自起总结轮。
+- 2026-09-14（同日二次回修 · v0.3.1）：初版把触发点只放在 `turn/end`，主人的意图是**「在当前 turn 就能压缩」**——于是补 `agent/pre-step` 触发点（I7）：指令落在同一轮的下一个 step，压缩**不需要额外一轮**；`turn/end` 保留为「会话空闲时主动压」的兜底。两个触发点共用同一判定与留痕，飞行检测（`hasOpenCompaction`）保证不重复触发。
 
 ## 10 未决问题
 1. 直触压缩与「爱丽丝轮内 `session_compact`」是否需要一个显式互斥说明？（当前靠引擎 `active` + `hasOpenCompaction` 双保险）
