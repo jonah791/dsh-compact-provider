@@ -19,6 +19,9 @@ import z from '@deepseek-ai/schemastery'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { AgentCompactEngine } from 'dsh-agent-compact'
+import {
+  precheckCompact, successNote, failureDetail, createCheckpointBestEffort,
+} from './policy.ts'
 
 export const name = 'compact-provider'
 export const inject = ['llm', 'tokenMeter', 'sessions', 'tools', 'checkpoint'] as const
@@ -46,31 +49,34 @@ export function apply(ctx: Context, config: Record<string, unknown>): void {
     },
     output: { schema: { type: 'object', additionalProperties: false, properties: { ok: { type: 'boolean', required: true }, note: { type: 'string' }, error: { type: 'string' } } }, render: (_a: any, v: any) => [{ type: 'text', text: v.ok ? (v.note ?? 'ok') : (v.error ?? '') }] },
     async execute(args: { reason?: string }, exec: { agent?: Agent; signal: AbortSignal }) {
-      if (!args.reason) return { ok: false, error: 'reason 必填（自主决策留痕）' }
-      if (!compaction) return { ok: false, error: 'compaction seam 不可用（AgentCompactEngine 未就绪）' }
       const agent = exec.agent
-      if (!agent) return { ok: false, error: '当前执行无 agent 上下文' }
+      const precondition = precheckCompact({
+        reason: args.reason,
+        hasCompaction: Boolean(compaction),
+        hasAgent: Boolean(agent),
+      })
+      if (!precondition.ok) return { ok: false, error: precondition.error }
+      // 判据已由 precheckCompact 给出（早退顺序一致）；断言仅为类型收窄，无运行期行为
+      const seam = compaction!
+      const target = agent!
+      const reason = args.reason!
       // 压缩前自动存档（保命优先 2026-09-06）：压缩是上下文整合，先留健康快照防试错损失。
       // best-effort：checkpoint 服务不可用或存档失败不阻塞压缩（压缩本身可重试）。
+      await createCheckpointBestEffort(
+        () => (ctx as unknown as { checkpoint?: { create(reason: string): Promise<unknown> } }).checkpoint,
+        reason,
+        logger,
+      )
       try {
-        const cp = (ctx as unknown as { checkpoint?: { create(reason: string): Promise<unknown> } }).checkpoint
-        if (cp !== undefined) {
-          await cp.create('压缩前自动存档（' + (args.reason ?? '') + '）')
-          logger.info('压缩前自动存档完成（' + args.reason + '）')
-        }
-      } catch (err) {
-        logger.warn('压缩前自动存档失败（不阻塞压缩）: ' + String(err))
-      }
-      try {
-        logger.info('爱丽丝决策压缩: ' + args.reason)
+        logger.info('爱丽丝决策压缩: ' + reason)
         // 关键：不传 exec.signal——工具调用被回合打断（abort）会触发 agent.cancel 导致 whenIdle 永不 resolve；
         // 用独立 controller，压缩事务与工具回合解耦
-        await compaction.compactNow(agent, new AbortController().signal, 'alice-self-compact')
-        return { ok: true, note: '压缩已启动：' + (args.reason ?? '') + '（压缩前已自动存档）——请输出 <compacted-summary> checkpoint 完成事务' }
+        await seam.compactNow(target, new AbortController().signal, 'alice-self-compact')
+        return { ok: true, note: successNote(reason) }
       } catch (err) {
-        const stack = err instanceof Error ? (err.stack ?? String(err)) : String(err)
+        const { error, stack } = failureDetail(err)
         logger.error('压缩启动失败堆栈: ' + stack)
-        return { ok: false, error: '压缩启动失败: ' + String(err) + '\n' + stack.slice(0, 2000) }
+        return { ok: false, error }
       }
     },
   }))
