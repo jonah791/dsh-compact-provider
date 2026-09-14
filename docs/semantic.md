@@ -1,102 +1,139 @@
-# dsh-compact-provider · 语义文档
+# 语义文档：压缩入口与直触（Compaction Entry & Direct Trigger）
 
-## 1 元信息
-- id: `compact-provider-direct-trigger`
-- 版本: v0.3.0（2026-09-14）
-- owner: 爱丽丝（alice）
-- 主副本: 本文件（`self-plugins/dsh-compact-provider/docs/semantic.md`）
-- 实现落点: `src/index.ts`（装配 + IO + 调度）、`src/direct.ts`（纯判定）
-- 测试: `tests/direct.test.mjs`（纯函数，`node --test`）
+> 版本 v0.3.2 · 2026-09-14 · 作者：爱丽丝 · 状态：**已实现**
+> 开发方式：语义文档优先（先写清「是什么/什么关系/怎么裁决」，再让实现逼近，最后用实践回修）
+> 实现落点：`self-plugins/dsh-compact-provider/src/{index,direct}.ts`
+> 语义主副本：本文；引擎侧契约见 `self-plugins/dsh-agent-compact/docs/semantic.md`（互相指认）
 
-## 2 定位与反定位
-**定位**：本插件把自研 `AgentCompactEngine` 挂载为 `compaction` 服务，并提供三条压缩入口：
-1. `session_compact` 工具（爱丽丝轮内自主决策，代价 = 意图请求 + 摘要请求）；
-2. **直触压缩**（`turn/end` 处按常设授权直接开跑，代价 = 摘要请求一笔）——本版新增；
-3. 引擎自身的 `auto` 路径（官方 replay 摘要器，本部署 `auto: false`，未启用）。
+---
 
-**反定位**：
-- 不是「框架自动压缩」：不读阈值自动压，而是执行**爱丽丝撰写的常设授权**（见 §4 不变量 I2）。
-- 不替代官方 `/compact` 命令路径；不改引擎的 summary/replace 事务字节格式（与官方 compaction-basic 可互换）。
-- 不负责「何时该压」的价值观判断——那是爱丽丝的决策，本模块只执行已授权的策略并留痕。
+## 1 · 定位与反定位
 
-## 3 术语
-- **意图请求**：为在轮内调用 `session_compact` 而先发生的正常轮模型请求（实测 563,054 tok）。
-- **摘要请求**：模型看见全文并输出 `<compacted-summary>` 的那次请求（实测 566,783 tok）。
-- **直触**：在 `turn/end` 边界直接启动压缩事务，不经过「爱丽丝先花一轮说要压缩」。
-- **常设授权**：`.dsh/compact-direct-policy.json`，由爱丽丝撰写、可随时改写或删除的策略文件。
-- **飞行中**：最近一次 `compaction/start` 晚于最近一次 `compaction/end`（事务未落定）。
+**定位**：本插件是压缩的**入口层**——把自研 `AgentCompactEngine` 挂载为 `compaction` 服务，并提供三条入口：① `session_compact` 工具（爱丽丝轮内自主决策）② **直触压缩**（常设授权命中即直接开跑：`agent/pre-step` 轮内压制 + `turn/end` 空闲兜底）③ 引擎 `auto` 路径（本部署未启用）。同时负责**授权/状态/留痕**三份落盘。
 
-## 4 概念模型与不变量
-模型（两个触发点共用同一判定）：`agent/pre-step`（轮内每步前）或 `turn/end`（每轮收尾）→ 取该会话的 agent → `tokenMeter.measure` → 读授权 + 状态 → **纯函数判定** → 触发/跳过 → 留痕。
+**反定位（本文不管什么）**：
+- 不管压缩事务本身（指令投递、捕获、表层换血 → `dsh-agent-compact`）
+- 不管提醒（【上下文提醒】/【压缩告警】→ `dsh-agent-context`；压缩提醒 → `dsh-agent-skill-forge`）
+- **不是**框架自动压缩：`auto` 保持 `false`；直触执行的是**爱丽丝撰写的常设授权**，不是内置阈值规则
 
-- **I1 决策归爱丽丝**：触发只能来自她撰写的授权文件；文件缺失/损坏 → 永不触发（fail-closed）。
-- **I2 授权会衰减**：`expiresAt` 到期即失效（不可解析的 `expiresAt` 同样视为过期）。
-- **I3 至多一次**：每次触发前先写状态（`lastTriggeredAtMs` + 日计数），崩溃不会导致重复触发。
-- **I4 可追溯**：每一次判定（含跳过）落一行 `.dsh/compact-direct.jsonl`（数字 + 结论）。
-- **I5 只碰用户会话**：`session-*` 前缀；派生会话（子代理裸 uuid）不直触。
-- **I6 不改事务语义**：直触复用引擎 `compactNow`，事件序列与工具路径完全一致。
-- **I7 轮内可压（2026-09-14 主人定调）**：触发点之一在 `agent/pre-step`（轮内每一步之前），压缩**不需要额外一轮**——总结指令落在**同一轮的下一个 step**，checkpoint 与 `compaction/end` 都在触发所在的那一轮内完成（与 turn 71 实测同形：8092 触发 → 8097 checkpoint，同一轮）。`agent/pre-step` 是 waterfall：必须 `next()` 放行、**不 await**、2 秒节流、异常一律吞掉。
+## 2 · 术语表
 
-## 5 契约（含调用点清单）
-### 5.1 授权文件 `.dsh/compact-direct-policy.json`
-```json
-{
-  "authorized": true,
-  "thresholdTokens": 500000,
-  "maxPerDay": 8,
-  "cooldownMs": 600000,
-  "expiresAt": "2026-09-21T00:00:00+08:00",
-  "note": "常设授权：越阈值即直触压缩（省掉意图请求）"
-}
+| 术语 | 含义 |
+|------|------|
+| 意图请求 | 为在轮内调用工具而先发生的正常轮请求（实测 563,054 tok） |
+| 摘要请求 | 模型输出 checkpoint 的那笔请求（实测 566,783 tok） |
+| 直触 | 不由「爱丽丝先花一轮说我要压缩」触发，而由**轮内 pre-step 或轮末 turn/end** 按授权直接启动压缩事务 |
+| 常设授权 | `.dsh/compact-direct-policy.json`，由爱丽丝撰写、可随时改写/删除/到期失效 |
+| 飞行中 | 最近一次 `compaction/start` 晚于最近一次 `compaction/end`（事务未落定） |
+| 留痕 | `.dsh/compact-direct.jsonl`，**每一次判定**（触发与跳过）一行 |
+
+## 3 · 概念模型
+
 ```
-字段语义：`authorized` 必须为 `true`；其余缺省回退 `DEFAULT_*`；`expiresAt` 省略 = 不过期。
+两个触发点 ──┬─ agent/pre-step（轮内每步之前，2s 节流）──┐
+             └─ session/event turn/end（每轮收尾）────────┤
+                                                        ▼
+                        evaluateDirectTrigger(sessionId)
+                          ├─ 取 agent（agent/status 或 pre-step 记住的）
+                          ├─ tokenMeter.measure(session).totalTokens
+                          ├─ 读授权 parseDirectPolicy(.dsh/compact-direct-policy.json)
+                          ├─ 读状态 readState(.dsh/compact-direct-state.json)
+                          ├─ 读事件流：hasOpenCompaction（在飞行）/ latestCompactionOutcome（上次结局）
+                          ├─ 纯判定 decideDirectCompaction(...)
+                          ├─ 留痕 appendLedger(每行含 tokens/阈值/今日数/上次触发/结论)
+                          └─ 命中 → 先写状态（至多一次）→ 压缩前存档 → compactNow(..., 'alice-direct-compact')
+```
 
-### 5.2 状态与留痕（本插件写）
-- `.dsh/compact-direct-state.json`：`{ lastTriggeredAtMs, history: number[] }`（history 保留 3 天，`pruneHistory`）。
-- `.dsh/compact-direct.jsonl`：每次判定一行 `{at, atMs, session, tokens, action: trigger|skip, reason, detail}`。
+不变量（invariants）：
+1. **I1 决策归爱丽丝**：授权文件缺失/损坏/`authorized≠true` → **永不触发**（fail-closed）
+2. **I2 授权会衰减**：`expiresAt` 到期即失效；**不可解析的 `expiresAt` 同样视为已过期**
+3. **I3 至多一次**：触发前先落状态（`lastTriggeredAtMs` + 日计数），此刻崩溃也不会重复触发
+4. **I4 可追溯**：每次判定（含跳过）落一行 `.jsonl`（tokens/阈值/今日数/理由）
+5. **I5 只碰用户会话**：`session-*` 前缀；派生会话（子代理裸 uuid）不直触
+6. **I6 不改事务语义**：直触复用引擎 `compactNow`，事件序列与工具路径完全一致
+7. **I7 轮内可压**：`agent/pre-step` 触发点让压缩**不需要额外一轮**——指令落在同一轮的下一个 step，checkpoint 与 `compaction/end` 都在触发所在那一轮内完成（`agent/pre-step` 是 waterfall：必须 `next()` 放行、**不 await**、异常一律吞掉）
+8. **I8 失败即允许重试**：最近一次 `compaction/end` 带 error ⇒ 跳过冷却立即重试（重试仍受 `maxPerDay` 约束）——失败没缩小上下文，「触发过」≠「已处理」
 
-### 5.3 触发产生的事件（复用引擎，形状不变）
-`compaction/start{sourceCommandId:"alice-direct-compact"}` → `agent/inbox/spliced`（指令入队）→ 模型输出 checkpoint → `compaction/summary` → `user/message`（替换表层）→ `compaction/end`。
+## 4 · 契约
 
-### 5.4 调用点清单
-| 调用点 | 位置 | 作用 |
-|---|---|---|
-| `ctx.on('agent/status')` | `src/index.ts` | 记住 `session.id → agent`（`turn/end` 时按 id 取回；不依赖新 inject） |
-| `ctx.on('agent/pre-step')` | `src/index.ts` | **轮内触发点**（waterfall：`next()` 放行、不 await、2 秒节流）⇒ 压缩落在当前轮（I7） |
-| `ctx.on('session/event')` `turn/end` | `src/index.ts` | **空闲兜底触发点**（`setImmediate` 让 turn 真正收尾） |
-| `parseDirectPolicy` / `decideDirectCompaction` | `src/direct.ts` | 纯判定（无 IO） |
-| `hasOpenCompaction` | `src/direct.ts` | 飞行检测（读事件流，有界回溯） |
-| `compaction.compactNow(agent, signal, DIRECT_COMPACT_COMMAND_ID)` | `src/index.ts` | 引擎入口（与工具路径同一函数） |
-| `session_compact` 工具 | `src/index.ts` | 爱丽丝轮内路径（不变；代价仍含意图请求） |
+### 4.1 三份落盘（`DSH_HOME`，不进 git）
+- `.dsh/compact-direct-policy.json`：`{authorized, thresholdTokens, maxPerDay, cooldownMs, expiresAt, note}`；缺省字段回退 `DEFAULT_*`（500k / 8 / 600000）
+- `.dsh/compact-direct-state.json`：`{lastTriggeredAtMs, history: number[]}`（history 保留 3 天，`pruneHistory`）
+- `.dsh/compact-direct.jsonl`：`{at, atMs, session, tokens, action: 'trigger'|'skip', reason, detail}`；超 512KB 保留末尾 400 行
 
-## 6 边界与信任
-- **授权文件是信任边界**：能写该文件者即可让本会话自动压缩；文件在 `DSH_HOME`（本机、非仓库），不进 git。
-- **读失败 = 不触发**（fail-closed）：JSON 坏、权限错、路径不存在一律走「未授权」分支并留痕。
-- **写失败不阻塞压缩**：留痕/状态写盘失败只 `logger.warn`；但**状态写失败则当轮不触发**（保 I3）。
-- **不越权扩范围**：只看 `totalTokens`，不看内容、不读消息正文。
+### 4.2 裁决（纯函数优先）
+`decideDirectCompaction(input) → {trigger, reason, detail}`：
 
-## 7 可证伪验收
-| # | 断言 | 判据 | 状态 |
-|---|---|---|---|
-| A1 | 授权缺失 → 不触发且留痕 `skip/未授权` | 单测 + `.dsh/compact-direct.jsonl` 行 | 待线上验收 |
-| A2 | `tokens < threshold` → skip/未越阈值 | 单测（84,302 < 500,000） | 待线上验收 |
-| A3 | `tokens ≥ threshold` 且授权有效 → trigger | 单测（566,783 ≥ 500,000） | 待线上验收 |
-| A4 | 冷却/日限额/飞行中 → skip | 单测各一例 | 待线上验收 |
-| A5 | 一次直触压缩的全上下文请求数 = **1**（今日工具路径为 2：563,054 + 566,783） | 事件流 `assistant/message.usage` 按 turn 汇总 | 待线上验收 |
-| A6 | 直触产物与工具路径同形（`compaction/start|summary|end` + `sourceCommandId="alice-direct-compact"`） | 事件流 | 待线上验收 |
-| A7 | 授权到期/不可解析 → 不触发 | 单测 | 待线上验收 |
-| A8 | **轮内可压（I7）**：直触的 checkpoint 与 `compaction/end` 落在**触发所在的那一轮**（不需要额外一轮） | 事件流：`compaction/start.turn` = `compaction/end.turn` = checkpoint 的 `assistant/message.turn` | 待线上验收 |
-| A9 | 轮内触发点不阻塞这一步：`agent/pre-step` 后本步请求正常发生 | 事件流 step 序列连续 + 无 `turn/end.reason=error` | 待线上验收 |
+| 输入状态 | 裁决 | 理由 |
+|---------|------|------|
+| 非 `session-*` | skip | 派生会话不直触 |
+| `policy === null` | skip | 未授权 / 文件损坏（fail-closed） |
+| 授权过期或 `expiresAt` 不可解析 | skip | 授权衰减 |
+| `compactionActive` | skip | 事务在飞行 |
+| 距上次触发 < `cooldownMs` 且**上次未失败** | skip | 冷却 |
+| 今日触发 ≥ `maxPerDay` | skip | 日限额 |
+| `tokens < thresholdTokens` | skip | 未越阈值 |
+| 其余（含「上次失败」） | **trigger** | 越阈值直触 / 失败重试 |
 
-## 8 与实现关系
-- 纯函数（可单测）：`parseDirectPolicy`、`decideDirectCompaction`、`countTriggeredToday`、`pruneHistory`、`ledgerLine`、`hasOpenCompaction`。
-- 有 IO（装配层）：`readPolicy`、`readState`、`writeState`、`appendLedger`、调度与 `compactNow` 调用——全部在 `src/index.ts`，不参与单测。
+### 4.3 调用点清单 `[MUST]`
 
-## 9 实践修订记录
-- 2026-09-14（本版缘起）：主人指出「现在完成① 触发那一拍的正常请求（563k，只为说出『我要压缩』），就可以直接进行压缩」。取证：turn 71 两笔请求 563,054 + 566,783 = `1.13M`（GUI「用量 1.1M tok」逐字吻合），确认①为可省项；`agentSummarize` 的 `agent.send(..., 'next-turn', true)` 证明直触能自起总结轮。
-- 2026-09-14（同日二次回修 · v0.3.1）：初版把触发点只放在 `turn/end`，主人的意图是**「在当前 turn 就能压缩」**——于是补 `agent/pre-step` 触发点（I7）：指令落在同一轮的下一个 step，压缩**不需要额外一轮**；`turn/end` 保留为「会话空闲时主动压」的兜底。两个触发点共用同一判定与留痕，飞行检测（`hasOpenCompaction`）保证不重复触发。
+| 调用方 | 调用点（文件:符号） | 时机 |
+|-------|------------------|------|
+| 宿主事件 | `src/index.ts` `ctx.on('agent/status')` | 记住 `session.id → agent`（不新增 inject） |
+| 宿主事件 | `src/index.ts` `ctx.on('agent/pre-step')` | **轮内触发点**（waterfall，`next()` 放行） |
+| 宿主事件 | `src/index.ts` `ctx.on('session/event')` | `turn/end` 收尾后 `setImmediate` 判定（**空闲兜底触发点**） |
+| 工具面 | `src/index.ts` `session_compact` 工具 | 爱丽丝轮内自主决策（代价仍含意图请求） |
+| 引擎 | `compaction.compactNow(agent, signal, 'alice-direct-compact')` | 直触实际启动事务 |
+| checkpoint 服务 | `ctx.checkpoint.create(...)` | 两条入口压缩前都先存档（保命优先） |
 
-## 10 未决问题
-1. 直触压缩与「爱丽丝轮内 `session_compact`」是否需要一个显式互斥说明？（当前靠引擎 `active` + `hasOpenCompaction` 双保险）
-2. 直触后是否需要向会话投递一条「本次压缩由常设授权触发」的可见提醒？（当前只落 `.jsonl` 与插件日志）
-3. 阈值是否应随模型上下文窗口比例化（当前固定 500k，与提醒阈值一致）。
+## 5 · 边界与信任
+
+- **授权文件是信任边界**：能写该文件者即可让本会话自动压缩；文件在本机 `DSH_HOME`，不进仓库
+- 不越界清单：只看 `totalTokens`，不读消息正文；不代替引擎做事务；不在 `auto:false` 时启用引擎的 replay 路径
+- 失败面：① 授权读失败 → 判「未授权」并留痕（**响**）② 状态写失败 → **当轮不触发**（保 I3，留 warn）③ 留痕写失败 → 只 warn，不阻塞压缩 ④ 压缩事务失败 → 引擎写 `compaction/end.error`，本插件据此允许重试（I8）
+
+## 6 · 与既有机制的关系
+
+- AGENTS.md **§2.1/§2.4**（决策归爱丽丝 / 禁止框架自动压缩）：直触是**执行已授权决策**，不是自动决策机制；授权可删、可到期
+- AGENTS.md **§5.21**（压缩 checkpoint 纪律）：checkpoint 独占一轮；压缩后立刻查存档
+- AGENTS.md **§5.11 §6**（重建 ≠ 生效）：判据是「进程启动时间 vs `lib` mtime」
+- 与引擎分工：本插件管**入口/授权/留痕**，`dsh-agent-compact` 管**事务/捕获/换血**
+
+## 7 · 可证伪验收清单
+
+| # | 可证伪命题 | 证据 | 状态 |
+|---|-----------|------|------|
+| A1 | 授权缺失 → skip/未授权且留痕 | 单测 + `.jsonl` 行 | 已实测（单测） |
+| A2 | `tokens < 阈值` → skip/未越阈值 | 单测（84,302 < 500,000）+ 真实行 `tokens=316662 threshold=500000` | 已实测 |
+| A3 | `tokens ≥ 阈值` 且授权有效 → trigger | 单测（566,783）+ 真实行 `tokens=321155 threshold=250000 …→ 直触` | 已实测 |
+| A4 | 冷却 / 日限额 / 飞行中 → skip | 单测各一例 + 真实行 `冷却中（还剩 297893ms）` | 已实测 |
+| A5 | **轮内可压（I7）**：`compaction/start.turn` = `compaction/end.turn` = checkpoint 的 turn | 事件流 | **待线上验收** |
+| A6 | 直触产物与工具路径同形（`sourceCommandId="alice-direct-compact"`） | 事件流 8673（`turn=77 src=alice-direct-compact`） | 已实测 |
+| A7 | 授权到期/不可解析 → skip | 单测 | 已实测（单测） |
+| A8 | 上次事务失败 → 跳过冷却立即重试（I8） | 单测 + `.jsonl` 行 | 已实测（单测）/ **待线上验收** |
+| A9 | `agent/pre-step` 不阻塞本步请求（`next()` 放行） | 事件流 step 序列连续、无 `turn/end.reason=error` | 已实测（无异常） |
+| A10 | 一次直触压缩的全上下文请求数 = 1 | 按 turn 汇总 `assistant/message.usage` | **待线上验收** |
+| A11 | 触发前必先落状态（至多一次） | `.jsonl` + state 行时序 | 已实测 |
+
+## 8 · 与实现的关系
+
+- 主实现：`src/index.ts`（装配、IO、两触发点、`compactNow` 调用）、`src/direct.ts`（全部纯判定）
+- 同语义副本：无；消费方契约副本（引擎）见 `dsh-agent-compact/docs/semantic.md`
+- 未实现/未验证部分**显式标注**：① A5/A8/A10 待线上验收（需要一次真实成功的直触）② `agent/pre-step` 触发点尚未在「单独越阈值且无其他工作」的会话上实测 ③ 状态文件未做并发写保护（单进程假设）
+
+## 9 · 实践修订记录
+
+- **2026-09-14 首次实践（意图请求可省）**
+  - 语义**被确认**：`agentSummarize` 用 `agent.send(..., 'next-turn', true)` 会自起总结轮 ⇒ 触发点不在「爱丽丝那一轮」即可省掉意图请求
+  - 语义**被补充**：授权/状态/留痕三份落盘 + 纯判定全部可单测（16/16）
+- **2026-09-14 二次实践（轮内可压 · v0.3.1）**
+  - 语义**被修正**：初版只把触发点放在 `turn/end` ⇒ 压缩落到**下一轮**，与主人「在当前 turn 就能压缩」不符 ⇒ 补 `agent/pre-step` 触发点（I7）
+- **2026-09-14 三次实践（失败不缩小上下文 · v0.3.2）**
+  - 语义**被补充**：触发成功 ≠ 事务成功——真实事故 01:13:27Z 触发、`compaction/end`(seq 8781) 报 `never reached the model-visible surface`，上下文 321k→345k **毫发未缩**，而冷却把下一次机会挡了 10 分钟 ⇒ **I8 失败即允许重试**（`latestCompactionOutcome`）
+  - 教训：留痕必须记录**结局**而不只是**触发**；「触发过」不能当作「已处理」
+
+## 10 · 未决问题
+
+- **U1** 直触成功/失败是否需要在会话里可见（当前只落 `.jsonl` 与插件日志，GUI 只见压缩卡与 `sourceCommandId`）
+- **U2** 阈值是否随模型上下文窗口比例化（当前固定值，与提醒阈值同源）
+- **U3** 多实例（并行会话）共享 `.dsh` 时，state/ledger 是否需要按会话分文件或加锁

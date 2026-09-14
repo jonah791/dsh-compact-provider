@@ -34,6 +34,7 @@ import {
   countTriggeredToday,
   decideDirectCompaction,
   hasOpenCompaction,
+  latestCompactionOutcome,
   ledgerLine,
   parseDirectPolicy,
   pruneHistory,
@@ -189,10 +190,12 @@ export function apply(ctx: Context, config: Record<string, unknown>): void {
     }
     const view = agent.session as unknown as {
       seq: number
-      eventAt(seq: number): { readonly type?: string } | undefined
+      eventAt(seq: number): { readonly type?: string; readonly data?: unknown } | undefined
     }
     const { policy } = parseDirectPolicy(readJson(policyPath))
     const state = readState()
+    // 上次直触是否失败：失败不缩小上下文 ⇒ 允许跳过冷却立即重试（2026-09-14 二次事故 fca6c9bc）
+    const outcome = latestCompactionOutcome(view, view.seq)
     const decision = decideDirectCompaction({
       tokens,
       isUserSession: sessionId.startsWith('session-'),
@@ -201,6 +204,7 @@ export function apply(ctx: Context, config: Record<string, unknown>): void {
       lastTriggeredAtMs: state.lastTriggeredAtMs,
       triggeredToday: countTriggeredToday(state.history, nowMs),
       compactionActive: hasOpenCompaction(view, view.seq),
+      lastTriggerFailed: outcome !== null && outcome.error !== null,
     })
     appendLedger(ledgerLine({
       atMs: nowMs,

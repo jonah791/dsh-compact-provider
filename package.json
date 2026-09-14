@@ -1,6 +1,6 @@
 {
   "name": "dsh-compact-provider",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "压缩一体化插件：AgentCompactEngine 挂载 compaction 服务 + session_compact 工具原语 + 直触压缩（pre-step 轮内压制 / turn-end 空闲压制，省掉意图请求）",
   "type": "module",
   "main": "lib/index.js",

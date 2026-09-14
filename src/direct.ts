@@ -29,6 +29,8 @@ export const DEFAULT_THRESHOLD_TOKENS = 500_000
 export const DEFAULT_MAX_PER_DAY = 8
 /** 默认冷却：两次直触之间至少间隔（防同轮/连续轮反复触发）。 */
 export const DEFAULT_COOLDOWN_MS = 600_000
+/** 默认回溯窗口：足够覆盖一次到数轮对话内的压缩事件（事件流有界回溯，不扫全库）。 */
+export const DEFAULT_LOOKBACK = 400
 /** 直触压缩的 `sourceCommandId`：事件流与 GUI 里可辨认「这次不是爱丽丝轮内触发的」。 */
 export const DIRECT_COMPACT_COMMAND_ID = 'alice-direct-compact'
 /** `expiresAt` 不可解析时的落值：视为**已过期**（fail-closed，宁可不压也不越权）。 */
@@ -113,6 +115,12 @@ export interface DirectDecisionInput {
   readonly triggeredToday: number
   /** 该会话是否已有压缩事务在飞行。 */
   readonly compactionActive: boolean
+  /**
+   * 上一次直触是否**失败**（最近一次 `compaction/end` 带 error）。
+   * 2026-09-14 二次事故：直触事务失败时上下文毫发未缩，而冷却（10min）会把下一次机会挡在门外
+   * ——「触发过」被误当成「已处理」。失败 ⇒ 跳过冷却立即重试（重试次数仍受 maxPerDay 约束）。
+   */
+  readonly lastTriggerFailed: boolean
 }
 
 /** 判定结论：`reason` = 人读结论，`detail` = 带数字的证据行。 */
@@ -157,7 +165,8 @@ export function decideDirectCompaction(input: DirectDecisionInput): DirectDecisi
   if (compactionActive) {
     return { trigger: false, reason: '已有压缩事务在飞行', detail }
   }
-  if (lastTriggeredAtMs !== null && nowMs - lastTriggeredAtMs < policy.cooldownMs) {
+  // 失败即允许立即重试（跳过冷却）：失败的事务没缩小上下文，「触发过」≠「已处理」
+  if (lastTriggeredAtMs !== null && !input.lastTriggerFailed && nowMs - lastTriggeredAtMs < policy.cooldownMs) {
     return {
       trigger: false,
       reason: '冷却中（还剩 ' + String(policy.cooldownMs - (nowMs - lastTriggeredAtMs)) + 'ms）',
@@ -172,8 +181,10 @@ export function decideDirectCompaction(input: DirectDecisionInput): DirectDecisi
   }
   return {
     trigger: true,
-    reason: '越阈值直触（省掉意图请求）',
-    detail: detail + ' → 直触',
+    reason: input.lastTriggerFailed
+      ? '上次直触事务失败 → 跳过冷却立即重试'
+      : '越阈值直触（省掉意图请求）',
+    detail: detail + (input.lastTriggerFailed ? ' lastOutcome=error → 重试' : ' → 直触'),
   }
 }
 
@@ -242,7 +253,36 @@ export function ledgerLine(entry: DirectLedgerEntry): string {
 /** 会话事件视图（与引擎内部同形：`seq` + `eventAt`）。 */
 export interface CompactionEventView {
   readonly seq: number
-  eventAt(seq: number): { readonly type?: string } | undefined
+  eventAt(seq: number): { readonly type?: string; readonly data?: unknown } | undefined
+}
+
+/**
+ * 最近一次压缩事务的结局（成功/失败）。
+ *
+ * 用途（2026-09-14 二次事故）：直触的事务可能失败（`compaction/end.error`），而失败**不缩小上下文**；
+ * 判定必须据此跳过冷却允许重试——否则「触发过」被误当成「已处理」。
+ * @param view - 会话事件视图
+ * @param fromSeq - 起点（通常是 `session.seq`）
+ * @param lookback - 最多向前回溯多少 seq
+ * @returns 最近一次 `compaction/end` 的 seq 与错误（无错则 error=null）；窗口内没有则 null
+ */
+export function latestCompactionOutcome(
+  view: CompactionEventView,
+  fromSeq: number,
+  lookback = DEFAULT_LOOKBACK,
+): { readonly seq: number; readonly error: string | null } | null {
+  const floor = Math.max(0, fromSeq - lookback)
+  for (let seq = fromSeq; seq >= floor; seq -= 1) {
+    const event = view.eventAt(seq)
+    if (event === null || event === undefined || typeof event !== 'object') continue
+    if (event.type !== 'compaction/end') continue
+    const data = event.data
+    const raw = data !== null && typeof data === 'object'
+      ? (data as { error?: unknown }).error
+      : undefined
+    return { seq, error: typeof raw === 'string' && raw.length > 0 ? raw : null }
+  }
+  return null
 }
 
 /**
@@ -258,7 +298,7 @@ export interface CompactionEventView {
 export function hasOpenCompaction(
   view: CompactionEventView,
   fromSeq: number,
-  lookback = 400,
+  lookback = DEFAULT_LOOKBACK,
 ): boolean {
   const floor = Math.max(0, fromSeq - lookback)
   let startSeq: number | null = null
