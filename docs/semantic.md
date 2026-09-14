@@ -90,6 +90,25 @@
 | 引擎 | `compaction.compactNow(agent, signal, 'alice-direct-compact')` | 直触实际启动事务 |
 | checkpoint 服务 | `ctx.checkpoint.create(...)` | 两条入口压缩前都先存档（保命优先） |
 
+### 4.4 请求侧侧车轨迹 `[MUST]`（2026-09-14 补）
+
+**问题**：引擎侧轨迹（`dsh-agent-compact` 的 `<DSH_HOME>/compaction-trace.jsonl`）从 `begin` 起笔，于是「**谁发起 / 什么时候 / 为什么 / 前置判据过没过**」在文件里是空白——恰恰是 Q2 与 Q3 的前半段。取证只能回头反解会话事件流。
+
+**契约**：本插件把入口侧四个阶段写**同一个文件**（不另开文件——单一落点、按 `atMs` 天然 join）：
+
+| 阶段 | 含义 | 关键字段 |
+|------|------|---------|
+| `requested` | `session_compact` 工具被调用 | `side:'provider'`, `commandId:'alice-self-compact'`, `agentId`, `reason`（摘要：折叠空白 + 80 字符截断） |
+| `rejected` | 前置判据未通过，**未触 seam** | `side:'provider'`, `ok:false`, `error` |
+| `completed` | seam 返回 | `side:'provider'`, `ok:true`, `waitedMs` |
+| `failed` | seam 抛错（只取首行、截 200 字符，**堆栈不落盘**） | `side:'provider'`, `ok:false`, `error` |
+
+不变量：
+- **I9 判据单一真源**：路径解析 / 行序列化 / 追加实现**全部**从引擎转出（`import { compactTrace } from 'dsh-agent-compact'`），本插件**不自己**实现落盘——两套实现必然漂移（§5.22 规则 4）。转出走主入口而非 `package.json` 子路径导出：消费方副本的 `package.json` 由 pnpm 重写，新增子路径导出不会同步（实测），届时 `ERR_PACKAGE_PATH_NOT_EXPORTED` 会让 provider 装载失败 = 压缩路径整体不可用。
+- **I10 观测绝不反噬**：`compactTrace` 返回 `bool`，调用方**一律忽略**——它只影响证据，绝不影响压缩是否发生。
+- **I11 `rejected` 是未触 seam 的唯一证据**：判据没过时引擎侧一行都不会有。
+- **I12 两侧按 `atMs` join**：`requested → begin → queued → waited → surfaced → captured → completed` 即一笔完整事务；引擎行不带 `side`（向后兼容旧行），provider 行带 `side:'provider'`。
+
 ## 5 · 边界与信任
 
 - **授权文件是信任边界**：能写该文件者即可让本会话自动压缩；文件在本机 `DSH_HOME`，不进仓库
@@ -118,6 +137,10 @@
 | A9 | `agent/pre-step` 不阻塞本步请求（`next()` 放行） | 事件流 step 序列连续、无 `turn/end.reason=error` | 已实测（无异常） |
 | A10 | 一次直触压缩的全上下文请求数 = 1 | 按 turn 汇总 `assistant/message.usage` | **待线上验收** |
 | A11 | 触发前必先落状态（至多一次） | `.jsonl` + state 行时序 | 已实测 |
+| A12 | **调用工具即落 `requested`**（含 commandId/agentId/reason 摘要） | `tail -n 5 <DSH_HOME>/compaction-trace.jsonl` 见 `"phase":"requested","side":"provider"` | 已实测（单测 10/10 + 待线上首跑） |
+| A13 | **判据未过 ⇒ 落 `rejected` 且引擎侧无 `begin`** | 空 reason 调 `session_compact`；轨迹出现 `rejected` 且无同 `atMs` 区间的 `begin` | 已实测（单测） |
+| A14 | provider 与引擎**共用同一套判据**（serialize→parse 往返不丢字段） | `tests/trace-request.test.mjs`「判据单一真源」用例 | 已实测 |
+| A15 | 落盘失败 → 返回 `false` 且**不抛**、不影响压缩 | 尸体测试（父路径是普通文件） | 已实测 |
 
 ## 8 · 与实现的关系
 
@@ -126,6 +149,17 @@
 - 未实现/未验证部分**显式标注**：① A5/A8/A10 待线上验收（需要一次真实成功的直触）② `agent/pre-step` 触发点尚未在「单独越阈值且无其他工作」的会话上实测 ③ 状态文件未做并发写保护（单进程假设）
 
 ## 9 · 实践修订记录
+
+- **2026-09-14 五次实践（请求侧自证 · 回退版之上只加观测）**
+  - 动机：可维护性补课判本插件 S4 缺（"无落盘证据层"）。但真问题不是"没落盘"，而是**取证要反解会话流**：引擎侧从 `begin` 起笔，「谁发起 / 为什么 / 判据过没过」无处可查。
+  - 语义**被补充**：入口侧四阶段 `requested/rejected/completed/failed` 写**引擎同一个文件**（§4.4，I9–I12）。
+  - 语义**被确认（关键设计选择）**：**不自己实现落盘**——路径解析/序列化/追加全部 `import { compactTrace } from 'dsh-agent-compact'`。两套实现 = 两套判据，必然漂移。
+  - 事故预防（实测两处，均为"动手前先探"救下的）：
+    ① 子路径导出（`"./trace"`）在**消费方副本**里不存在——pnpm 重写了副本的 `package.json`（实测 `match './trace'` = **False**），走子路径导入会 `ERR_PACKAGE_PATH_NOT_EXPORTED` ⇒ **provider 装载失败 = 压缩路径整体不可用**。改走主入口转出（`./lib/index.js` 是硬链接，改动即时可见，实测哈希一致）。
+    ② 新增**文件**不会进副本（C7），但本次只**改**已有文件（`trace.ts`/`index.ts`）⇒ 实测 `lib/trace.js`、`lib/index.js`、`lib/types/index.d.ts` 三处哈希与源一致，无需补链。
+  - 教训：**"改压缩入口"必须先探消费方副本**——磁盘上构建成功 ≠ 运行时能加载。预检（full trial run）是最后一道闸门，本次部署前必须复跑。
+
+## 10 · 未决问题
 
 - **2026-09-14 首次实践（意图请求可省）**
   - 语义**被确认**：`agentSummarize` 用 `agent.send(..., 'next-turn', true)` 会自起总结轮 ⇒ 触发点不在「爱丽丝那一轮」即可省掉意图请求
@@ -144,3 +178,4 @@
 - **U1** 直触成功/失败是否需要在会话里可见（当前只落 `.jsonl` 与插件日志，GUI 只见压缩卡与 `sourceCommandId`）
 - **U2** 阈值是否随模型上下文窗口比例化（当前固定值，与提醒阈值同源）
 - **U3** 多实例（并行会话）共享 `.dsh` 时，state/ledger 是否需要按会话分文件或加锁
+- **U4** `<DSH_HOME>/compaction-trace.jsonl` 现在有**两个写者**（provider 与引擎）。JSONL 单行追加在常规文件系统下是原子的（每行远小于 PIPE_BUF），但并发多会话下**行间顺序**不保证全局单调——按 `atMs` join 即可，若将来出现乱序归因困难，再考虑按会话分文件。

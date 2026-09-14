@@ -3,7 +3,11 @@
  *
  * session_compact 的入口判据（含早退顺序）与全部文案构造、best-effort 存档包装。
  * 判据 = 源码唯一真源：本文件与原 index.ts 闭包内逻辑逐字等价（只搬位置）。
+ *
+ * 2026-09-14 追加：**请求侧轨迹条目构造**（纯数据，零 IO）。类型取自引擎转出的
+ * `TraceEntry`（type-only import，运行期被擦除——不引入对消费方副本的运行期依赖）。
  */
+import type { TraceEntry } from 'dsh-agent-compact'
 
 /** 存档失败/跳过时的最小 logger 面（宿主 ctx.logger 天然满足） */
 export interface PolicyLogger {
@@ -70,4 +74,63 @@ export async function createCheckpointBestEffort(
     logger?.warn('压缩前自动存档失败（不阻塞压缩）: ' + String(err))
     return false
   }
+}
+
+// ─────────────── 请求侧轨迹（provider 侧自证 · 2026-09-14）───────────────
+//
+// 动机：引擎侧轨迹从 `begin` 起笔，于是「**谁发起、什么时候、为什么、前置判据过没过**」
+// 在文件里是空白——那正是 Q2 与 Q3 的前半段。本层补 `requested` / `rejected` /
+// `completed` / `failed` 四个阶段，写**引擎同一个文件**（`<DSH_HOME>/compaction-trace.jsonl`），
+// 用 `side:'provider'` 区分，与引擎侧 `begin/queued/waited/surfaced/captured/abort`
+// 按 `atMs` 天然 join 成一笔完整事务。
+//
+// 纪律：本层只构造**纯数据**（零 IO、零时间）；落盘由接线层调引擎转出的 `compactTrace`
+// 完成（判据单一真源——路径解析/序列化/追加实现与引擎共用一份）。
+// 观测绝不反噬：`compactTrace` 失败返回 false，调用方一律忽略返回值。
+
+/** 请求侧轨迹条目（去掉由引擎侧补的 atMs/build） */
+export type ProviderTraceEntry = Omit<TraceEntry, 'atMs' | 'build'>
+
+/** reason 摘要：折叠空白 + 截断（决策留痕足够，不落全文） */
+export function summarizeReason(reason: string, max = 80): string {
+  const flat = reason.replace(/\s+/g, ' ').trim()
+  return flat.length > max ? flat.slice(0, max) + '…' : flat
+}
+
+/** agent 标识摘要：安全取用，任何形状都不抛（拿不到即 'n/a'） */
+export function agentLabel(agent: unknown, max = 16): string {
+  try {
+    const a = agent as { id?: unknown; sessionId?: unknown } | null | undefined
+    const raw = a?.sessionId ?? a?.id
+    const s = typeof raw === 'string' && raw !== '' ? raw : 'n/a'
+    return s.length > max ? s.slice(0, max) : s
+  } catch {
+    return 'n/a'
+  }
+}
+
+/** 工具入口被调用（含 commandId 与 reason 摘要） */
+export function requestEntry(reason: string, agent: string): ProviderTraceEntry {
+  return {
+    phase: 'requested',
+    side: 'provider',
+    commandId: 'alice-self-compact',
+    agentId: agent,
+    reason: summarizeReason(reason),
+  }
+}
+
+/** 前置判据未通过：**未触 seam**（因此引擎侧不会有 begin——这条是唯一证据） */
+export function rejectedEntry(error: string): ProviderTraceEntry {
+  return { phase: 'rejected', side: 'provider', ok: false, error }
+}
+
+/** seam 返回（事务已启动；成败细节看引擎侧后续阶段） */
+export function completedEntry(waitedMs: number): ProviderTraceEntry {
+  return { phase: 'completed', side: 'provider', ok: true, waitedMs }
+}
+
+/** seam 抛错（入口侧视角的失败；引擎侧可能另有 abort） */
+export function failedEntry(error: string): ProviderTraceEntry {
+  return { phase: 'failed', side: 'provider', ok: false, error: error.split('\n')[0]!.slice(0, 200) }
 }

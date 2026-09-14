@@ -18,9 +18,10 @@ import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { Agent } from '@deepseek-ai/dsh-agent'
-import { AgentCompactEngine } from 'dsh-agent-compact'
+import { AgentCompactEngine, compactTrace } from 'dsh-agent-compact'
 import {
   precheckCompact, successNote, failureDetail, createCheckpointBestEffort,
+  agentLabel, requestEntry, rejectedEntry, completedEntry, failedEntry,
 } from './policy.ts'
 
 export const name = 'compact-provider'
@@ -50,12 +51,21 @@ export function apply(ctx: Context, config: Record<string, unknown>): void {
     output: { schema: { type: 'object', additionalProperties: false, properties: { ok: { type: 'boolean', required: true }, note: { type: 'string' }, error: { type: 'string' } } }, render: (_a: any, v: any) => [{ type: 'text', text: v.ok ? (v.note ?? 'ok') : (v.error ?? '') }] },
     async execute(args: { reason?: string }, exec: { agent?: Agent; signal: AbortSignal }) {
       const agent = exec.agent
+      const t0 = Date.now()
+      // 请求侧轨迹（2026-09-14）：引擎侧从 begin 起笔，「谁发起 / 为什么 / 判据过没过」在
+      // 文件里是空白——那正是 Q2 与 Q3 的前半段。compactTrace 失败返回 false，**一律忽略**
+      // （观测绝不反噬主流程；路径/序列化与引擎共用一份实现 = 判据单一真源）。
+      if (args.reason) compactTrace(requestEntry(args.reason, agentLabel(agent)))
       const precondition = precheckCompact({
         reason: args.reason,
         hasCompaction: Boolean(compaction),
         hasAgent: Boolean(agent),
       })
-      if (!precondition.ok) return { ok: false, error: precondition.error }
+      if (!precondition.ok) {
+        // 未触 seam ⇒ 引擎侧不会有任何行，这条 rejected 是唯一证据
+        compactTrace(rejectedEntry(precondition.error))
+        return { ok: false, error: precondition.error }
+      }
       // 判据已由 precheckCompact 给出（早退顺序一致）；断言仅为类型收窄，无运行期行为
       const seam = compaction!
       const target = agent!
@@ -72,10 +82,12 @@ export function apply(ctx: Context, config: Record<string, unknown>): void {
         // 关键：不传 exec.signal——工具调用被回合打断（abort）会触发 agent.cancel 导致 whenIdle 永不 resolve；
         // 用独立 controller，压缩事务与工具回合解耦
         await seam.compactNow(target, new AbortController().signal, 'alice-self-compact')
+        compactTrace(completedEntry(Date.now() - t0))
         return { ok: true, note: successNote(reason) }
       } catch (err) {
         const { error, stack } = failureDetail(err)
         logger.error('压缩启动失败堆栈: ' + stack)
+        compactTrace(failedEntry(error))
         return { ok: false, error }
       }
     },
