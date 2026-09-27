@@ -1,6 +1,6 @@
 {
   "name": "dsh-compact-provider",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "压缩一体化插件：AgentCompactEngine 挂载 compaction 服务 + session_compact 工具原语（爱丽丝自主决策压缩）",
   "type": "module",
   "main": "lib/index.js",
