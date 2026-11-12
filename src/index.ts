@@ -42,6 +42,7 @@ export function apply(ctx: Context, config: Record<string, unknown>): void {
 
   ctx.tools.register(defineTool({
     name: 'session_compact',
+    deferLoading: true,
     description:
       '显式压缩当前会话：把 summary 作为 checkpoint 交给引擎，替换「本条消息之前」的全部历史。'
       + '**主路径不需要这个工具**——在任意一轮输出里直接写 checkpoint 块（首行哨兵 <!-- alice-compact -->，'
